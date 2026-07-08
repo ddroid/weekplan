@@ -1,0 +1,24 @@
+[package]
+name = "weekplan"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = "0.9"
+adw = { package = "libadwaita", version = "0.7", features = ["v1_7"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+dirs = "6"
+
+# High-performance release profile
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Faster debug builds
+[profile.dev]
+opt-level = 1
