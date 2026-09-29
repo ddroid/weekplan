@@ -1,471 +1,686 @@
-use gtk4 as gtk;
 use adw::prelude::*;
-use gtk::glib;
-use gtk::{
-    gdk, Align, Box as GtkBox, Button, ListBox, Orientation,
-    ScrolledWindow, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, SelectionMode, PolicyType,
-};
+use gtk4 as gtk;
+use gtk::{gdk, gio, glib, Align, Orientation};
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use crate::data::{self, DAY_NAMES, Task, WeekData};
+use chrono::{Datelike, NaiveDate};
 
-// ─── Public Entry Points ────────────────────────────────────────────────────
+use crate::data::{self, DAY_NAMES, Draft, Repeat, Task, WeekData};
+
+/// Widest the seven-column week grows before it stops stretching.
+const WEEK_MAX_WIDTH: i32 = 1400;
+/// Below this the window shows one day with a day switcher.
+const NARROW: &str = "max-width: 720sp";
+
+const CSS: &str = ".task-done .task-title { text-decoration-line: line-through; }";
 
 pub fn load_css() {
-    // No custom CSS needed — we rely entirely on Adwaita's built-in classes
-    // (boxed-list, suggested-action, destructive-action, etc.)
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(CSS);
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Target {
+    New(usize),
+    Edit(u64),
+}
+
+struct Column {
+    root: gtk::Box,
+    label: gtk::Label,
+    add: gtk::Button,
+    list: gtk::ListBox,
+    empty: gtk::Label,
+}
+
+struct Ui {
+    data: RefCell<WeekData>,
+    columns: Vec<Column>,
+    clamp: adw::Clamp,
+    header: adw::HeaderBar,
+    week_title: adw::WindowTitle,
+    switcher: adw::ToggleGroup,
+    toasts: adw::ToastOverlay,
+    window: adw::ApplicationWindow,
+    narrow: Cell<bool>,
+    selected: Cell<usize>,
+    rendered_on: Cell<NaiveDate>,
 }
 
 pub fn build_ui(app: &adw::Application) {
-    let week_data = Rc::new(RefCell::new(WeekData::load()));
+    let today = data::today_index();
 
-    // ── ViewStack with 7 day pages ──────────────────────────────────────
-    let view_stack = adw::ViewStack::new();
-    view_stack.set_vexpand(true);
-
-    // Store per-day list boxes so we can refresh them
-    let day_list_boxes: Rc<RefCell<Vec<ListBox>>> = Rc::new(RefCell::new(Vec::new()));
-    // Store per-day stack containers (GtkBox wrapping either list or status page)
-    let day_containers: Rc<RefCell<Vec<GtkBox>>> = Rc::new(RefCell::new(Vec::new()));
-
-    for day_idx in 0..7usize {
-        let is_today = day_idx == data::today_index();
-        let day_name = DAY_NAMES[day_idx];
-
-        // Each page: ScrolledWindow → Clamp → vertical box
-        let page_box = GtkBox::new(Orientation::Vertical, 0);
-        page_box.set_vexpand(true);
-
-        let content_box = GtkBox::new(Orientation::Vertical, 12);
-        content_box.set_margin_top(24);
-        content_box.set_margin_bottom(24);
-        content_box.set_margin_start(12);
-        content_box.set_margin_end(12);
-
-        // Day subtitle label
-        let day_label_text = format!("{}", day_name);
-        let day_subtitle = gtk::Label::new(Some(&day_label_text));
-        day_subtitle.add_css_class("title-4");
-        day_subtitle.set_halign(Align::Start);
-        day_subtitle.set_margin_start(4);
-        day_subtitle.set_margin_bottom(4);
-
-        // Task ListBox with boxed-list style
-        let list_box = ListBox::new();
-        list_box.set_selection_mode(SelectionMode::None);
-        list_box.add_css_class("boxed-list");
-
-        content_box.append(&day_subtitle);
-        content_box.append(&list_box);
-
-        // Clamp to keep content well-sized on wide screens
-        let clamp = adw::Clamp::builder()
-            .maximum_size(600)
-            .tightening_threshold(400)
-            .child(&content_box)
-            .build();
-
-        let scrolled = ScrolledWindow::builder()
-            .hscrollbar_policy(PolicyType::Never)
-            .vscrollbar_policy(PolicyType::Automatic)
-            .vexpand(true)
-            .child(&clamp)
-            .build();
-
-        page_box.append(&scrolled);
-
-        // Populate tasks or show empty state
-        {
-            let wd = week_data.borrow();
-            if wd.days[day_idx].is_empty() {
-                show_empty_state(&content_box, &list_box, day_name);
-            } else {
-                for task in &wd.days[day_idx] {
-                    let row = build_task_row(task, day_idx, &week_data, &list_box, &content_box);
-                    list_box.append(&row);
-                }
-            }
-        }
-
-        // Determine icon for the day tab
-        let icon = if is_today {
-            "starred-symbolic"
-        } else if day_idx < 5 {
-            "office-calendar-symbolic"
-        } else {
-            "weather-clear-symbolic"
-        };
-
-        // Short name for the tab (3 letters)
-        let short_name = &day_name[..3];
-        view_stack.add_titled_with_icon(&page_box, Some(day_name), short_name, icon);
-
-        day_list_boxes.borrow_mut().push(list_box);
-        day_containers.borrow_mut().push(content_box);
+    let week_box = gtk::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .homogeneous(true)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let columns: Vec<Column> = (0..7).map(|_| build_column()).collect();
+    for column in &columns {
+        week_box.append(&column.root);
     }
 
-    // Set today's page as visible
-    view_stack.set_visible_child_name(DAY_NAMES[data::today_index()]);
-
-    // ── Header bar with InlineViewSwitcher ─────────────────────────────
-    let view_switcher = adw::InlineViewSwitcher::builder()
-        .stack(&view_stack)
-        .can_shrink(true)
+    let clamp = adw::Clamp::builder()
+        .maximum_size(WEEK_MAX_WIDTH)
+        .tightening_threshold(WEEK_MAX_WIDTH)
+        .child(&week_box)
         .build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&clamp)
+        .build();
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&scrolled));
 
+    let switcher = adw::ToggleGroup::new();
+    for (day, name) in DAY_NAMES.iter().enumerate() {
+        switcher.add(adw::Toggle::builder().label(&name[..3]).name(day.to_string()).build());
+    }
+    switcher.set_active_name(Some(&today.to_string()));
+
+    let week_title = adw::WindowTitle::new("Week Plan", "");
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&view_switcher));
-
-    // ── Add Task button (header end) ────────────────────────────────────
-    let add_button = Button::builder()
+    header.set_title_widget(Some(&week_title));
+    let add_button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
-        .tooltip_text("Add Task")
+        .tooltip_text("Add Task (Ctrl+N)")
+        .action_name("win.add-task")
         .build();
-    add_button.add_css_class("flat");
     header.pack_end(&add_button);
 
-    // Connect add button
-    {
-        let view_stack_ref = view_stack.clone();
-        let week_data = week_data.clone();
-        let day_list_boxes = day_list_boxes.clone();
-        let day_containers = day_containers.clone();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&toasts));
 
-        add_button.connect_clicked(move |btn| {
-            // Determine which day is currently visible
-            let active_name = view_stack_ref
-                .visible_child_name()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let day_idx = DAY_NAMES
-                .iter()
-                .position(|&n| n == active_name)
-                .unwrap_or(0);
-
-            show_add_task_dialog(
-                btn,
-                day_idx,
-                &week_data,
-                &day_list_boxes,
-                &day_containers,
-            );
-        });
-    }
-
-    // ── ToolbarView assembly ────────────────────────────────────────────
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&view_stack));
-
-    // ── Keyboard navigation (← →) ──────────────────────────────────────
-    let key_ctrl = EventControllerKey::new();
-    {
-        let view_stack = view_stack.clone();
-        key_ctrl.connect_key_pressed(move |_, key, _, _| {
-            let current_name = view_stack
-                .visible_child_name()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let current_idx = DAY_NAMES
-                .iter()
-                .position(|&n| n == current_name)
-                .unwrap_or(0);
-
-            let new_idx = match key {
-                gdk::Key::Left if current_idx > 0 => current_idx - 1,
-                gdk::Key::Right if current_idx < 6 => current_idx + 1,
-                _ => return glib::Propagation::Proceed,
-            };
-
-            view_stack.set_visible_child_name(DAY_NAMES[new_idx]);
-            glib::Propagation::Stop
-        });
-    }
-    toolbar_view.add_controller(key_ctrl);
-
-    // ── Scroll navigation ───────────────────────────────────────────────
-    let scroll_ctrl = EventControllerScroll::new(
-        EventControllerScrollFlags::VERTICAL | EventControllerScrollFlags::HORIZONTAL,
-    );
-    {
-        let view_stack = view_stack.clone();
-        // Accumulate fractional scroll deltas before switching
-        let scroll_accum: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.0));
-
-        scroll_ctrl.connect_scroll(move |_, dx, dy| {
-            let delta = if dy.abs() > dx.abs() { dy } else { dx };
-            let mut accum = scroll_accum.borrow_mut();
-            *accum += delta;
-
-            let threshold = 2.0;
-            if accum.abs() < threshold {
-                return glib::Propagation::Stop;
-            }
-
-            let direction = *accum;
-            *accum = 0.0;
-            drop(accum);
-
-            let current_name = view_stack
-                .visible_child_name()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let current_idx = DAY_NAMES
-                .iter()
-                .position(|&n| n == current_name)
-                .unwrap_or(0);
-
-            let new_idx = if direction > 0.0 && current_idx < 6 {
-                current_idx + 1
-            } else if direction < 0.0 && current_idx > 0 {
-                current_idx - 1
-            } else {
-                return glib::Propagation::Stop;
-            };
-
-            view_stack.set_visible_child_name(DAY_NAMES[new_idx]);
-            glib::Propagation::Stop
-        });
-    }
-    toolbar_view.add_controller(scroll_ctrl);
-
-    // ── Window ──────────────────────────────────────────────────────────
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Week Plan")
-        .default_width(800)
-        .default_height(600)
-        .content(&toolbar_view)
+        .default_width(1100)
+        .default_height(640)
+        .width_request(360)
+        .content(&toolbar)
         .build();
+
+    let ui = Rc::new(Ui {
+        data: RefCell::new(WeekData::load()),
+        columns,
+        clamp,
+        header,
+        week_title,
+        switcher,
+        toasts,
+        window: window.clone(),
+        narrow: Cell::new(false),
+        selected: Cell::new(today),
+        rendered_on: Cell::new(data::today()),
+    });
+
+    for (day, column) in ui.columns.iter().enumerate() {
+        {
+            let ui = ui.clone();
+            column.add.connect_clicked(move |_| ui.show_dialog(Target::New(day)));
+        }
+        // Rows carry their task id as the widget name.
+        let ui = ui.clone();
+        column.list.connect_row_activated(move |_, row| {
+            if let Ok(id) = row.widget_name().parse() {
+                ui.show_dialog(Target::Edit(id));
+            }
+        });
+    }
+    ui.refresh_all();
+
+    let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::parse(NARROW).unwrap());
+    {
+        let ui = ui.clone();
+        breakpoint.connect_apply(move |_| ui.set_narrow(true));
+    }
+    {
+        let ui = ui.clone();
+        breakpoint.connect_unapply(move |_| ui.set_narrow(false));
+    }
+    window.add_breakpoint(breakpoint);
+
+    {
+        let ui2 = ui.clone();
+        ui.switcher.connect_active_name_notify(move |group| {
+            if let Some(day) = group.active_name().and_then(|n| n.parse().ok()) {
+                ui2.selected.set(day);
+                ui2.update_columns();
+            }
+        });
+    }
+
+    let add_action = gio::SimpleAction::new("add-task", None);
+    {
+        let ui = ui.clone();
+        add_action.connect_activate(move |_, _| {
+            let day = if ui.narrow.get() { ui.selected.get() } else { data::today_index() };
+            ui.show_dialog(Target::New(day));
+        });
+    }
+    window.add_action(&add_action);
+    app.set_accels_for_action("win.add-task", &["<Control>n"]);
+
+    let keys = gtk::EventControllerKey::new();
+    {
+        let ui = ui.clone();
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            if !ui.narrow.get() || !mods.is_empty() {
+                return glib::Propagation::Proceed;
+            }
+            let day = ui.selected.get();
+            let next = match key {
+                gdk::Key::Left if day > 0 => day - 1,
+                gdk::Key::Right if day < 6 => day + 1,
+                _ => return glib::Propagation::Proceed,
+            };
+            ui.switcher.set_active_name(Some(&next.to_string()));
+            glib::Propagation::Stop
+        });
+    }
+    toolbar.add_controller(keys);
+
+    // Weekly check marks and the today highlight go stale if the app stays open overnight.
+    {
+        let ui = ui.clone();
+        window.connect_is_active_notify(move |w| {
+            if w.is_active() && ui.rendered_on.get() != data::today() {
+                ui.refresh_all();
+            }
+        });
+    }
 
     window.present();
 }
 
-// ─── Task Row (AdwActionRow) ────────────────────────────────────────────────
+fn build_column() -> Column {
+    let label = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+    label.add_css_class("heading");
+    let add = gtk::Button::builder().icon_name("list-add-symbolic").build();
+    add.add_css_class("flat");
+    add.add_css_class("circular");
 
-fn build_task_row(
-    task: &Task,
-    day_idx: usize,
-    week_data: &Rc<RefCell<WeekData>>,
-    list_box: &ListBox,
-    content_box: &GtkBox,
-) -> adw::ActionRow {
-    // Build subtitle: combine time and description
-    let subtitle = match (task.time.is_empty(), task.description.is_empty()) {
-        (false, false) => format!("🕐 {}  ·  {}", task.time, task.description),
-        (false, true) => format!("🕐 {}", task.time),
-        (true, false) => task.description.clone(),
-        (true, true) => String::new(),
-    };
+    let head = gtk::Box::new(Orientation::Horizontal, 6);
+    head.set_margin_start(6);
+    head.append(&label);
+    head.append(&add);
 
-    let row = adw::ActionRow::builder()
-        .title(&task.title)
-        .subtitle(&subtitle)
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .valign(Align::Start)
         .build();
+    list.add_css_class("boxed-list");
 
-    // Delete button as suffix
-    let del_btn = Button::builder()
-        .icon_name("edit-delete-symbolic")
-        .valign(Align::Center)
-        .tooltip_text("Remove task")
-        .build();
-    del_btn.add_css_class("flat");
-    del_btn.add_css_class("circular");
+    let empty = gtk::Label::builder().label("Nothing planned").xalign(0.0).margin_start(6).build();
+    empty.add_css_class("dim-label");
 
-    let task_id = task.id;
-    let week_data = week_data.clone();
-    let list_box = list_box.clone();
-    let content_box = content_box.clone();
-    let row_clone = row.clone();
+    let root = gtk::Box::new(Orientation::Vertical, 8);
+    root.append(&head);
+    root.append(&list);
+    root.append(&empty);
 
-    del_btn.connect_clicked(move |_| {
-        week_data.borrow_mut().remove_task(day_idx, task_id);
-        list_box.remove(&row_clone);
-
-        // If list is now empty, show empty state
-        if list_box.first_child().is_none() {
-            show_empty_state(&content_box, &list_box, DAY_NAMES[day_idx]);
-        }
-    });
-
-    row.add_suffix(&del_btn);
-    row
+    Column { root, label, add, list, empty }
 }
 
-// ─── Empty State (AdwStatusPage) ────────────────────────────────────────────
-
-fn show_empty_state(content_box: &GtkBox, list_box: &ListBox, day_name: &str) {
-    // Hide the list box, show a status page instead
-    list_box.set_visible(false);
-
-    // Check if a status page already exists
-    let mut child = content_box.first_child();
-    while let Some(c) = child {
-        if c.css_classes().iter().any(|cls| cls.as_str() == "empty-status-page") {
-            c.set_visible(true);
-            return;
+impl Ui {
+    fn refresh_all(self: &Rc<Self>) {
+        self.rendered_on.set(data::today());
+        let (first, last) = (data::date_of(0), data::date_of(6));
+        let range = if first.month() == last.month() {
+            format!("{}–{}", first.format("%-d"), last.format("%-d %B"))
+        } else {
+            format!("{}–{}", first.format("%-d %b"), last.format("%-d %b"))
+        };
+        self.week_title.set_subtitle(&range);
+        for day in 0..7 {
+            self.refresh(day);
         }
-        child = c.next_sibling();
+        self.update_columns();
     }
 
-    let status = adw::StatusPage::builder()
-        .icon_name("calendar-symbolic")
-        .title(&format!("No tasks for {}", day_name))
-        .description("Press + to add a recurring task")
-        .vexpand(true)
-        .build();
-    status.add_css_class("empty-status-page");
-    content_box.append(&status);
-}
-
-fn hide_empty_state(content_box: &GtkBox, list_box: &ListBox) {
-    list_box.set_visible(true);
-
-    let mut child = content_box.first_child();
-    while let Some(c) = child {
-        if c.css_classes().iter().any(|cls| cls.as_str() == "empty-status-page") {
-            c.set_visible(false);
+    fn refresh(self: &Rc<Self>, day: usize) {
+        let column = &self.columns[day];
+        while let Some(row) = column.list.row_at_index(0) {
+            column.list.remove(&row);
         }
-        child = c.next_sibling();
-    }
-}
-
-// ─── Add Task Dialog (AdwDialog) ────────────────────────────────────────────
-
-fn show_add_task_dialog(
-    parent: &impl IsA<gtk::Widget>,
-    day_idx: usize,
-    week_data: &Rc<RefCell<WeekData>>,
-    day_list_boxes: &Rc<RefCell<Vec<ListBox>>>,
-    day_containers: &Rc<RefCell<Vec<GtkBox>>>,
-) {
-    let day_name = DAY_NAMES[day_idx];
-
-    // ── Entry rows ──
-    let title_row = adw::EntryRow::builder()
-        .title("Task Title")
-        .build();
-
-    let time_row = adw::EntryRow::builder()
-        .title("Time (optional)")
-        .build();
-
-    let notes_row = adw::EntryRow::builder()
-        .title("Notes (optional)")
-        .build();
-
-    // ── Preferences group ──
-    let pref_group = adw::PreferencesGroup::builder()
-        .title(&format!("New task for {}", day_name))
-        .description("This task will repeat every week")
-        .build();
-    pref_group.add(&title_row);
-    pref_group.add(&time_row);
-    pref_group.add(&notes_row);
-
-    // ── Action buttons ──
-    let cancel_btn = Button::builder()
-        .label("Cancel")
-        .hexpand(true)
-        .build();
-
-    let add_btn = Button::builder()
-        .label("Add Task")
-        .hexpand(true)
-        .build();
-    add_btn.add_css_class("suggested-action");
-
-    let btn_box = GtkBox::new(Orientation::Horizontal, 12);
-    btn_box.set_homogeneous(true);
-    btn_box.set_margin_top(12);
-    btn_box.append(&cancel_btn);
-    btn_box.append(&add_btn);
-
-    // ── Dialog content ──
-    let dialog_content = GtkBox::new(Orientation::Vertical, 0);
-    dialog_content.set_margin_start(24);
-    dialog_content.set_margin_end(24);
-    dialog_content.set_margin_top(24);
-    dialog_content.set_margin_bottom(24);
-    dialog_content.append(&pref_group);
-    dialog_content.append(&btn_box);
-
-    // ── Header bar for dialog ──
-    let dialog_header = adw::HeaderBar::new();
-    dialog_header.set_show_end_title_buttons(false);
-    dialog_header.set_show_start_title_buttons(false);
-    let dialog_title = adw::WindowTitle::new("Add Task", day_name);
-    dialog_header.set_title_widget(Some(&dialog_title));
-
-    let dialog_toolbar = adw::ToolbarView::new();
-    dialog_toolbar.add_top_bar(&dialog_header);
-    dialog_toolbar.set_content(Some(&dialog_content));
-
-    // ── The dialog itself ──
-    let dialog = adw::Dialog::builder()
-        .title("Add Task")
-        .content_width(420)
-        .content_height(380)
-        .child(&dialog_toolbar)
-        .build();
-
-    // ── Cancel ──
-    {
-        let dialog = dialog.clone();
-        cancel_btn.connect_clicked(move |_| {
-            dialog.close();
-        });
+        let tasks = self.data.borrow().sorted_day(day);
+        for task in &tasks {
+            column.list.append(&self.task_row(task));
+        }
+        column.list.set_visible(!tasks.is_empty());
+        column.empty.set_visible(tasks.is_empty());
     }
 
-    // ── Add ──
-    let title_row_for_activate = title_row.clone();
-    {
-        let dialog = dialog.clone();
-        let title_row = title_row.clone();
-        let time_row = time_row.clone();
-        let notes_row = notes_row.clone();
-        let week_data = week_data.clone();
-        let day_list_boxes = day_list_boxes.clone();
-        let day_containers = day_containers.clone();
+    fn set_narrow(self: &Rc<Self>, narrow: bool) {
+        self.narrow.set(narrow);
+        if narrow {
+            self.header.set_title_widget(Some(&self.switcher));
+            self.clamp.set_maximum_size(600);
+        } else {
+            self.header.set_title_widget(Some(&self.week_title));
+            self.clamp.set_maximum_size(WEEK_MAX_WIDTH);
+        }
+        self.update_columns();
+    }
 
-        let do_add: Rc<dyn Fn()> = Rc::new(move || {
-            let title = title_row.text().to_string();
-            if title.trim().is_empty() {
-                title_row.grab_focus();
-                return;
+    fn update_columns(&self) {
+        let narrow = self.narrow.get();
+        let today = data::today_index();
+        for (day, column) in self.columns.iter().enumerate() {
+            let date = data::date_of(day);
+            let text = if narrow {
+                format!("{} {}", DAY_NAMES[day], date.format("%-d %B"))
+            } else {
+                format!("{} {}", &DAY_NAMES[day][..3], date.format("%-d"))
+            };
+            column.label.set_label(&text);
+            if day == today {
+                column.label.add_css_class("accent");
+            } else {
+                column.label.remove_css_class("accent");
             }
-            let time = time_row.text().to_string();
-            let notes = notes_row.text().to_string();
-
-            let task = week_data.borrow_mut().add_task(day_idx, title, time, notes);
-
-            // Add to the correct list box
-            let list_boxes = day_list_boxes.borrow();
-            let containers = day_containers.borrow();
-            let lb = &list_boxes[day_idx];
-            let cb = &containers[day_idx];
-
-            // Hide empty state, show list
-            hide_empty_state(cb, lb);
-
-            let row = build_task_row(&task, day_idx, &week_data, lb, cb);
-            lb.append(&row);
-
-            dialog.close();
-        });
-
-        add_btn.connect_clicked({
-            let do_add = do_add.clone();
-            move |_| do_add()
-        });
-
-        // Submit on Enter from title row
-        let s = do_add.clone();
-        title_row_for_activate.connect_apply(move |_| s());
+            column.add.set_tooltip_text(Some(&format!("Add to {}", DAY_NAMES[day])));
+            column.root.set_visible(!narrow || day == self.selected.get());
+        }
     }
 
-    dialog.present(Some(parent));
+    fn task_row(self: &Rc<Self>, task: &Task) -> gtk::ListBoxRow {
+        let done = task.is_done_this_week();
+        let check = gtk::CheckButton::builder()
+            .active(done)
+            .valign(Align::Start)
+            .tooltip_text(match task.repeat {
+                Repeat::Weekly => "Done for this week",
+                Repeat::Once => "Done",
+            })
+            .build();
+
+        let title = gtk::Label::builder()
+            .label(&task.title)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .lines(3)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        title.add_css_class("task-title");
+
+        let text = gtk::Box::new(Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        text.set_valign(Align::Center);
+        text.append(&title);
+
+        let when = if task.all_day { "All day" } else { task.time.as_str() };
+        let meta = [when, task.description.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if !meta.is_empty() || task.repeat == Repeat::Weekly {
+            let line = gtk::Box::new(Orientation::Horizontal, 4);
+            line.add_css_class("dim-label");
+            if task.repeat == Repeat::Weekly {
+                let icon = gtk::Image::from_icon_name("media-playlist-repeat-symbolic");
+                icon.set_pixel_size(12);
+                icon.set_valign(Align::Start);
+                icon.set_margin_top(2);
+                icon.set_tooltip_text(Some("Every week"));
+                line.append(&icon);
+            }
+            if !meta.is_empty() {
+                let label = gtk::Label::builder()
+                    .label(&meta)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .lines(2)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build();
+                label.add_css_class("caption");
+                line.append(&label);
+            }
+            text.append(&line);
+        }
+
+        let content = gtk::Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(10)
+            .margin_bottom(10)
+            .margin_start(10)
+            .margin_end(10)
+            .build();
+        content.append(&check);
+        content.append(&text);
+
+        let id = task.id;
+        let row = gtk::ListBoxRow::builder().child(&content).name(id.to_string()).build();
+        if done {
+            row.add_css_class("task-done");
+            row.add_css_class("dim-label");
+        }
+
+        {
+            let ui = self.clone();
+            check.connect_toggled(move |c| ui.set_done(id, c.is_active()));
+        }
+
+        let menu_click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        {
+            let ui = self.clone();
+            let row = row.clone();
+            menu_click.connect_pressed(move |_, _, x, y| ui.show_menu(&row, id, x, y));
+        }
+        row.add_controller(menu_click);
+
+        row
+    }
+
+    fn show_menu(self: &Rc<Self>, row: &gtk::ListBoxRow, id: u64, x: f64, y: f64) {
+        let Some((day, _)) = self.data.borrow().find(id) else {
+            return;
+        };
+        let list = &self.columns[day].list;
+
+        let actions = gio::SimpleActionGroup::new();
+        let edit = gio::SimpleAction::new("edit", None);
+        {
+            let ui = self.clone();
+            edit.connect_activate(move |_, _| ui.show_dialog(Target::Edit(id)));
+        }
+        let delete = gio::SimpleAction::new("delete", None);
+        {
+            let ui = self.clone();
+            delete.connect_activate(move |_, _| ui.delete(id));
+        }
+        let move_to = gio::SimpleAction::new("move", Some(glib::VariantTy::UINT32));
+        {
+            let ui = self.clone();
+            move_to.connect_activate(move |_, param| {
+                if let Some(to) = param.and_then(|p| p.get::<u32>()) {
+                    ui.move_task(id, to as usize);
+                }
+            });
+        }
+        actions.add_action(&edit);
+        actions.add_action(&delete);
+        actions.add_action(&move_to);
+
+        let days = gio::Menu::new();
+        for (to, name) in DAY_NAMES.iter().enumerate().filter(|(to, _)| *to != day) {
+            let item = gio::MenuItem::new(Some(name), None);
+            item.set_action_and_target_value(Some("task.move"), Some(&(to as u32).to_variant()));
+            days.append_item(&item);
+        }
+        let menu = gio::Menu::new();
+        menu.append(Some("Edit"), Some("task.edit"));
+        menu.append_submenu(Some("Move to"), &days);
+        let danger = gio::Menu::new();
+        danger.append(Some("Delete"), Some("task.delete"));
+        menu.append_section(None, &danger);
+
+        // Parented to the list, not the row, because moving or deleting rebuilds the rows.
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.insert_action_group("task", Some(&actions));
+        popover.set_parent(list);
+        popover.set_has_arrow(false);
+        let (px, py) = row.translate_coordinates(list, x, y).unwrap_or((0.0, 0.0));
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(px as i32, py as i32, 1, 1)));
+        popover.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        popover.popup();
+    }
+
+    fn set_done(self: &Rc<Self>, id: u64, done: bool) {
+        let Some((day, repeat)) = self.data.borrow().find(id).map(|(d, t)| (d, t.repeat)) else {
+            return;
+        };
+        match repeat {
+            Repeat::Weekly => {
+                self.data.borrow_mut().set_done(id, done);
+                self.refresh(day);
+            }
+            Repeat::Once if done => self.remove_with_undo(id, "Done"),
+            Repeat::Once => {}
+        }
+    }
+
+    fn delete(self: &Rc<Self>, id: u64) {
+        self.remove_with_undo(id, "Deleted");
+    }
+
+    fn remove_with_undo(self: &Rc<Self>, id: u64, verb: &str) {
+        let Some((day, idx, task)) = self.data.borrow_mut().remove(id) else {
+            return;
+        };
+        self.refresh(day);
+        let toast = adw::Toast::builder()
+            .title(format!("{verb}: {}", task.title))
+            .use_markup(false)
+            .button_label("Undo")
+            .timeout(5)
+            .build();
+        let task = RefCell::new(Some(task));
+        let ui = self.clone();
+        toast.connect_button_clicked(move |_| {
+            if let Some(task) = task.take() {
+                ui.data.borrow_mut().restore(day, idx, task);
+                ui.refresh(day);
+            }
+        });
+        self.toasts.add_toast(toast);
+    }
+
+    fn move_task(self: &Rc<Self>, id: u64, to: usize) {
+        let Some(from) = self.data.borrow_mut().move_to(id, to) else {
+            return;
+        };
+        self.refresh(from);
+        self.refresh(to);
+        if self.narrow.get() {
+            self.toasts.add_toast(adw::Toast::new(&format!("Moved to {}", DAY_NAMES[to])));
+        }
+    }
+
+    fn show_dialog(self: &Rc<Self>, target: Target) {
+        let (day, task) = match target {
+            Target::New(day) => (day, None),
+            Target::Edit(id) => match self.data.borrow().find(id) {
+                Some((day, task)) => (day, Some(task.clone())),
+                None => return,
+            },
+        };
+        let editing = task.is_some();
+
+        let title = adw::EntryRow::builder().title("Title").build();
+        let notes = adw::EntryRow::builder().title("Notes").build();
+        let day_row = adw::ComboRow::builder()
+            .title("Day")
+            .model(&gtk::StringList::new(&DAY_NAMES))
+            .selected(day as u32)
+            .build();
+        let weekly = adw::SwitchRow::builder().title("Repeat every week").build();
+        let all_day = adw::SwitchRow::builder().title("All day").build();
+        let time = adw::EntryRow::builder().title("Time, like 14:30 or 2pm").build();
+        if let Some(task) = &task {
+            title.set_text(&task.title);
+            notes.set_text(&task.description);
+            weekly.set_active(task.repeat == Repeat::Weekly);
+            all_day.set_active(task.all_day);
+            time.set_text(&task.time);
+        }
+        time.set_visible(!all_day.is_active());
+
+        let details = adw::PreferencesGroup::new();
+        details.add(&title);
+        details.add(&notes);
+        let when = adw::PreferencesGroup::new();
+        when.add(&day_row);
+        when.add(&weekly);
+        when.add(&all_day);
+        when.add(&time);
+
+        let content = gtk::Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(18)
+            .margin_top(12)
+            .margin_bottom(24)
+            .margin_start(24)
+            .margin_end(24)
+            .build();
+        content.append(&details);
+        content.append(&when);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let save = gtk::Button::with_label(if editing { "Save" } else { "Add" });
+        save.add_css_class("suggested-action");
+        let header = adw::HeaderBar::builder()
+            .show_start_title_buttons(false)
+            .show_end_title_buttons(false)
+            .build();
+        header.pack_start(&cancel);
+        header.pack_end(&save);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+
+        let dialog = adw::Dialog::builder()
+            .title(if editing { "Edit Task" } else { "New Task" })
+            .content_width(420)
+            .child(&toolbar)
+            .build();
+
+        let repeat_hint = {
+            let (weekly, day_row) = (weekly.clone(), day_row.clone());
+            move || {
+                let day = DAY_NAMES[day_row.selected() as usize];
+                weekly.set_subtitle(&if weekly.is_active() {
+                    format!("Every {day}")
+                } else {
+                    format!("This {day} only")
+                });
+            }
+        };
+        repeat_hint();
+        {
+            let hint = repeat_hint.clone();
+            weekly.connect_active_notify(move |_| hint());
+        }
+        day_row.connect_selected_notify(move |_| repeat_hint());
+        {
+            let time = time.clone();
+            all_day.connect_active_notify(move |s| time.set_visible(!s.is_active()));
+        }
+        time.connect_changed(|row| {
+            let text = row.text();
+            if text.trim().is_empty() || data::parse_time(&text).is_some() {
+                row.remove_css_class("error");
+            } else {
+                row.add_css_class("error");
+            }
+        });
+
+        let submit: Rc<dyn Fn()> = {
+            let ui = self.clone();
+            let dialog = dialog.clone();
+            let (title, notes, day_row, weekly, all_day, time) =
+                (title.clone(), notes.clone(), day_row.clone(), weekly.clone(), all_day.clone(), time.clone());
+            Rc::new(move || {
+                let name = title.text().trim().to_string();
+                if name.is_empty() {
+                    title.add_css_class("error");
+                    title.grab_focus();
+                    return;
+                }
+                let clock = if all_day.is_active() {
+                    String::new()
+                } else {
+                    let text = time.text();
+                    if text.trim().is_empty() {
+                        String::new()
+                    } else if let Some((h, m)) = data::parse_time(&text) {
+                        format!("{h:02}:{m:02}")
+                    } else {
+                        time.grab_focus();
+                        return;
+                    }
+                };
+                let draft = Draft {
+                    title: name,
+                    time: clock,
+                    description: notes.text().trim().to_string(),
+                    all_day: all_day.is_active(),
+                    repeat: if weekly.is_active() { Repeat::Weekly } else { Repeat::Once },
+                };
+                let to = day_row.selected() as usize;
+                match target {
+                    Target::New(_) => {
+                        ui.data.borrow_mut().add(to, draft);
+                        ui.refresh(to);
+                    }
+                    Target::Edit(id) => {
+                        if let Some(from) = ui.data.borrow_mut().update(id, to, draft) {
+                            ui.refresh(from);
+                        }
+                        ui.refresh(to);
+                    }
+                }
+                if ui.narrow.get() && to != ui.selected.get() {
+                    ui.switcher.set_active_name(Some(&to.to_string()));
+                }
+                dialog.close();
+            })
+        };
+
+        {
+            let submit = submit.clone();
+            save.connect_clicked(move |_| submit());
+        }
+        for row in [&title, &notes, &time] {
+            let submit = submit.clone();
+            row.connect_entry_activated(move |_| submit());
+        }
+        title.connect_changed(|row| row.remove_css_class("error"));
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| {
+                dialog.close();
+            });
+        }
+
+        if let Target::Edit(id) = target {
+            let delete = adw::ButtonRow::builder().title("Delete Task").build();
+            delete.add_css_class("destructive-action");
+            let group = adw::PreferencesGroup::new();
+            group.add(&delete);
+            content.append(&group);
+            let ui = self.clone();
+            let dialog = dialog.clone();
+            delete.connect_activated(move |_| {
+                dialog.close();
+                ui.delete(id);
+            });
+        }
+
+        dialog.present(Some(&self.window));
+        title.grab_focus();
+    }
 }
